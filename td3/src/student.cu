@@ -28,11 +28,10 @@ namespace IMAC
         return blockIdx.x == gridDim.x - 1 ? (arraySize - 1) % (2 * blockDim.x) + 1 : 2 * blockDim.x;
     }
 
-    __device__
-    void cuda_fillShrArray(const uint* const dev_array, const uint size)
-    {
-        extern __shared__ uint shr_array[];
 
+    __device__
+    void cuda_fillShrArray(volatile uint* shr_array, const uint* const dev_array, const uint size)
+    {
         int shr_idx = 2 * threadIdx.x;
         int dev_idx = shr_idx + 2 * blockIdx.x * blockDim.x;
         if (dev_idx < size)
@@ -47,6 +46,7 @@ namespace IMAC
                 shr_array[shr_idx + 1] = dev_array[dev_idx + 1];
             }
         }
+        __syncthreads();
     }
 
     // ==================================================== EX 1
@@ -57,7 +57,7 @@ namespace IMAC
         // account for unused space in case size is not a power of two.
         int numberToProcess = cuda_getNumberToProcess(size);
         // first, copy the input to the shared memory for this block.
-        cuda_fillShrArray(dev_array, size);
+        cuda_fillShrArray(shr_array, dev_array, size);
         // then, in-place max reduction.
         for (int step = 1;; step *= 2)
         {
@@ -75,22 +75,25 @@ namespace IMAC
             // lastly, copy from the shared memory to the corresponding space for this block.
             dev_partialMax[blockIdx.x] = shr_array[0];
         }
+        __syncthreads();
     }
 
-    // ==================================================== EX 2
+    // ==================================================== EX 2, EX3
     __global__
-    void maxReduce_ex2(const uint *const dev_array, const uint size, uint *const dev_partialMax)
+    void maxReduce_ex23(const uint *const dev_array, const uint size, uint *const dev_partialMax)
     {
         extern __shared__ uint shr_array[];
         // account for unused space in case size is not a power of two.
-        int numberToProcess = cuda_getNumberToProcess(size);
+        const int numberToProcess = cuda_getNumberToProcess(size);
         // first, copy the input to the shared memory for this block.
-        cuda_fillShrArray(dev_array, size);
+        cuda_fillShrArray(shr_array, dev_array, size);
         // then, in-place max reduction.
+
         for (int step = 1;; step *= 2)
         {
             int shr_idx = threadIdx.x;
-            int shr_next = shr_idx + (numberToProcess - 1) / (2 * step) + 1;
+            int numberToProcessStep = (numberToProcess - 1) / (2 * step) + 1;
+            int shr_next = shr_idx + numberToProcessStep;
             if (2 * shr_idx >= shr_next || shr_next >= numberToProcess)
             {
                 break;
@@ -103,9 +106,52 @@ namespace IMAC
             // lastly, copy from the shared memory to the corresponding space for this block.
             dev_partialMax[blockIdx.x] = shr_array[0];
         }
+        __syncthreads();
     }
 
+    // ==================================================== EX 4
+    __global__
+    void maxReduce_ex4(const uint *const dev_array, const uint size, uint *const dev_partialMax, int warpSize)
+    {
+        extern __shared__ uint shr_array[];
+        volatile uint* shr_array_vol = shr_array;
+        // account for unused space in case size is not a power of two.
+        const int numberToProcess = cuda_getNumberToProcess(size);
+        // first, copy the input to the shared memory for this block.
+        cuda_fillShrArray(shr_array_vol, dev_array, size);
+        // then, in-place max reduction.
+        for (int step = 1;; step *= 2)
+        {
+            int numberToProcessStep = (numberToProcess - 1) / (2 * step) + 1;
+            int shr_idx = threadIdx.x;
+            int shr_next = shr_idx + numberToProcessStep;
+            if (2 * shr_idx >= shr_next || shr_next >= numberToProcess)
+            {
+                break;
+            }
+            shr_array_vol[shr_idx] = umax(shr_array_vol[shr_idx], shr_array_vol[shr_next]);
+            if (numberToProcessStep <= warpSize * 2)
+            {
+                // no need to synchronise if there are only warpSize threads still running.
+                __syncthreads();
+            }
+        }
+        if (threadIdx.x == 0)
+        {
+            // lastly, copy from the shared memory to the corresponding space for this block.
+            dev_partialMax[blockIdx.x] = shr_array_vol[0];
+        }
+        __syncthreads();
+    }
 
+    int getWarpSize()
+    {
+        cudaDeviceProp prop;
+        int device;
+        HANDLE_ERROR(cudaGetDevice(&device));
+        HANDLE_ERROR( cudaGetDeviceProperties( &prop, device));
+        return prop.warpSize;
+    }
 
     // return a uint2 with x: dimBlock / y: dimGrid
     template<uint kernelType>
@@ -118,21 +164,27 @@ namespace IMAC
 
         unsigned long maxThreadsPerBlock	= prop.maxThreadsPerBlock;
 
+        // for thread number optimisation.
+        const int totalNumberThreads = sizeArray / 2 + 1;
+
         uint2 dimBlockGrid; // x: dimBlock / y: dimGrid
+        // std::cout << "ahhh: " << totalNumberThreads << std::endl;
 
         // Configure number of threads/blocks
         switch(kernelType)
         {
-            case KERNEL_EX1: case KERNEL_EX2:
+            case KERNEL_EX1:
+            case KERNEL_EX3:
+            case KERNEL_EX4:
+            case KERNEL_EX2:
+                dimBlockGrid.y = (totalNumberThreads - 1) / maxThreadsPerBlock + 1;
+                dimBlockGrid.x = (totalNumberThreads - 1) / dimBlockGrid.y + 1;
+                /*
                 // only allocating a single block of threads if the array length is small.
                 dimBlockGrid.x = std::max<uint>(1, std::min<uint>(sizeArray / 2, maxThreadsPerBlock));
                 // set number of blocks according to the size of the input array.
                 dimBlockGrid.y = std::max<uint>(1, std::max<uint>(1, (sizeArray - 1)) / dimBlockGrid.x);
-            case KERNEL_EX3:
-                /// TODO EX 3
-                break;
-            case KERNEL_EX4:
-                /// TODO EX 4
+                 */
                 break;
             case KERNEL_EX5:
                 /// TODO EX 5
@@ -175,15 +227,13 @@ namespace IMAC
                     maxReduce_ex1<<<dimBlockGrid.y, dimBlockGrid.x, bytesSharedMem>>>(dev_array, size, dev_partialMax);
                     break;
                 case KERNEL_EX2:
-                    maxReduce_ex2<<<dimBlockGrid.y, dimBlockGrid.x, bytesSharedMem>>>(dev_array, size, dev_partialMax);
-                    break;
                 case KERNEL_EX3:
-                    /// TODO EX 3
-                    std::cout << "Not implemented !" << std::endl;
+                    // same thing
+                    maxReduce_ex23<<<dimBlockGrid.y, dimBlockGrid.x, bytesSharedMem>>>(dev_array, size, dev_partialMax);
                     break;
                 case KERNEL_EX4:
                     /// TODO EX 4
-                    std::cout << "Not implemented !" << std::endl;
+                    maxReduce_ex4<<<dimBlockGrid.y, dimBlockGrid.x, bytesSharedMem>>>(dev_array, size, dev_partialMax, getWarpSize());
                     break;
                 case KERNEL_EX5:
                     /// TODO EX 5
@@ -246,6 +296,8 @@ namespace IMAC
         printTiming(timing1);
 		compare(res1, resCPU); // Compare results
 
+        // in this implementation ex2 and 3 are the same.
+        /*
 		std::cout << "========== Ex 2 " << std::endl;
 		uint res2 = 0; // result
 		// Launch reduction and get timing
@@ -254,6 +306,7 @@ namespace IMAC
         std::cout << " -> Done: ";
         printTiming(timing2);
 		compare(res2, resCPU);
+         */
 
 		std::cout << "========== Ex 3 " << std::endl;
 		uint res3 = 0; // result
@@ -273,6 +326,7 @@ namespace IMAC
         printTiming(timing4);
 		compare(res4, resCPU);
 
+        /*
 		std::cout << "========== Ex 5 " << std::endl;
 		uint res5 = 0; // result
 		// Launch reduction and get timing
@@ -281,6 +335,7 @@ namespace IMAC
         std::cout << " -> Done: ";
         printTiming(timing5);
 		compare(res5, resCPU);
+         */
 
 		// Free array on GPU
 		cudaFree( dev_array );

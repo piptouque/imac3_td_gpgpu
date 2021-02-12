@@ -92,7 +92,7 @@ namespace IMAC
 				array[i] = std::rand() % maxRnd;
 			else
 				array[i] = 79;
-		} 
+		}
 		if (std::rand() % 2 == 0 ) array[size - 1] = maxRnd + std::rand() % 797979;
 
 		uint resultCPU = 0;
