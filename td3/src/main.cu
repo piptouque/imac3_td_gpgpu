@@ -79,7 +79,7 @@ namespace IMAC
 		
 		std::cout << "Max reduce for an array of size " << size << std::endl;
 		
-		std::cout 	<< "Allocating array on host, " 
+		std::cout 	<< "Allocating array on host, "
 					<< ( (size * sizeof(uint)) >> 20 ) << " MB" << std::endl;
 		std::vector<uint> array(size, 0);
 

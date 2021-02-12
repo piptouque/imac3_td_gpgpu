@@ -8,7 +8,6 @@ BIN=convolution
 # FLAG
 FLAGS=-Wall -O3
 FLAGS_NVCC=-gencode=arch=compute_30,code=sm_30
-
 # INCLUDES
 INC=-I./include -I/usr/local/cuda/include
 # SRC Directory
